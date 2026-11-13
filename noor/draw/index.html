@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="theme-color" content="#0b2a24">
+<title>Draw on Noor TV</title>
+<style>
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body { margin: 0; height: 100%; background: #0b2a24; color: #f3efe2;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; }
+    body { display: flex; flex-direction: column; overscroll-behavior: none; }
+    header { display: flex; align-items: center; justify-content: space-between; padding: 12px 16px; }
+    .brand { font-size: 18px; color: #e2c46b; }
+    .brand small { color: #a9bfb3; font-size: 13px; margin-left: 6px; }
+    .pill { font-size: 13px; padding: 5px 10px; border-radius: 999px; background: #133a31; color: #a9bfb3; white-space: nowrap; }
+    .pill.ok { background: #1f5a44; color: #c9f2d9; }
+    .pill.bad { background: #5a2a24; color: #f6c9c1; }
+    main { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 0 12px; min-height: 0; }
+    #board { position: relative; flex: none; width: 100%; max-width: 1100px; aspect-ratio: 16 / 9; background: #0e3a2f;
+        border: 1px solid #3d5c4f; border-radius: 12px; overflow: hidden; touch-action: none; }
+    #board canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+    #hint { margin: 10px 0 0; font-size: 13px; color: #7f9a8d; text-align: center; }
+    .tools { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: center; padding: 12px 12px 18px; }
+    .swatch { width: 34px; height: 34px; border-radius: 50%; border: 3px solid transparent; padding: 0; cursor: pointer; }
+    .swatch.on { border-color: #f3efe2; }
+    .size { width: 42px; height: 34px; border-radius: 10px; border: 2px solid #3d5c4f; background: #133a31; color: #f3efe2; display: flex; align-items: center; justify-content: center; }
+    .size.on { border-color: #e2c46b; }
+    .size i { display: block; border-radius: 50%; background: #f3efe2; }
+    button.clear { height: 36px; padding: 0 16px; border-radius: 10px; border: 0; background: #e2c46b; color: #10251f; font-size: 15px; }
+    #join { display: none; flex-direction: column; align-items: center; gap: 14px; padding: 24px; text-align: center; }
+    #join p { color: #a9bfb3; margin: 0; max-width: 320px; line-height: 1.4; }
+    #code { font-size: 28px; letter-spacing: 8px; text-align: center; text-transform: uppercase; width: 230px; padding: 10px; border-radius: 12px;
+        border: 2px solid #3d5c4f; background: #133a31; color: #f3efe2; }
+    #join button { height: 44px; padding: 0 28px; border-radius: 12px; border: 0; background: #e2c46b; color: #10251f; font-size: 17px; }
+    #err { color: #f6c9c1; font-size: 14px; min-height: 18px; }
+    .joined #join { display: none; }
+    body:not(.joined) main, body:not(.joined) .tools { display: none; }
+    body:not(.joined) #join { display: flex; }
+    a { color: #e2c46b; }
+</style>
+</head>
+<body>
+<header>
+    <div class="brand">&#9790; Noor TV <small>Draw</small></div>
+    <div class="pill" id="status">Connecting...</div>
+</header>
+
+<section id="join">
+    <h2 style="margin:0;color:#e2c46b;font-weight:500">Draw on your TV</h2>
+    <p>On the TV, open Noor Wake Test and choose <b>Draw from phone</b>. Type the TV code shown there.</p>
+    <input id="code" maxlength="6" autocomplete="off" autocapitalize="characters" spellcheck="false" inputmode="text" placeholder="CODE">
+    <div id="err"></div>
+    <button id="join-btn" type="button">Connect</button>
+</section>
+
+<main>
+    <div id="board"><canvas id="canvas"></canvas></div>
+    <div id="hint">Draw with your finger. Turn your phone sideways for a bigger board. <a href="#" id="change">Change TV</a></div>
+</main>
+
+<div class="tools" id="tools"></div>
+
+<script src="paho-mqtt.min.js"></script>
+<script>
+(function () {
+    'use strict';
+    var BROKER = window.NOOR_BROKER || { host: 'broker.emqx.io', port: 8084, path: '/mqtt', ssl: true };
+    var COLORS = ['#e2c46b', '#f3efe2', '#5dcaa5', '#e24b4a', '#378add', '#ed93b1'];
+    var SIZES = [0.003, 0.006, 0.012];
+    var FLUSH_MS = 40;
+
+    var code = '';
+    var client = null;
+    var color = COLORS[0];
+    var size = SIZES[1];
+    var canvas = document.getElementById('canvas');
+    var ctx = canvas.getContext('2d');
+    var drawing = false;
+    var pending = [];
+    var lastSent = null;
+    var lastLocal = null;
+    var flushTimer = null;
+    var tvOnline = false;
+    var connected = false;
+    var sentSegments = 0;
+
+    function $(id) { return document.getElementById(id); }
+
+    function setStatus(text, kind) {
+        var el = $('status');
+        el.textContent = text;
+        el.className = 'pill' + (kind ? ' ' + kind : '');
+    }
+
+    function topic(name) { return 'noortv/v1/' + code + '/' + name; }
+
+    function validCode(c) { return /^[A-Z0-9]{6}$/.test(c); }
+
+    // ----- tools -----
+    function buildTools() {
+        var tools = $('tools');
+        COLORS.forEach(function (c, i) {
+            var b = document.createElement('button');
+            b.className = 'swatch' + (i === 0 ? ' on' : '');
+            b.style.background = c;
+            b.setAttribute('aria-label', 'Color ' + (i + 1));
+            b.onclick = function () {
+                color = c;
+                Array.prototype.forEach.call(document.querySelectorAll('.swatch'), function (s) { s.classList.remove('on'); });
+                b.classList.add('on');
+            };
+            tools.appendChild(b);
+        });
+        SIZES.forEach(function (s, i) {
+            var b = document.createElement('button');
+            b.className = 'size' + (i === 1 ? ' on' : '');
+            b.setAttribute('aria-label', ['Thin', 'Medium', 'Thick'][i] + ' line');
+            var dot = document.createElement('i');
+            dot.style.width = dot.style.height = (6 + i * 6) + 'px';
+            b.appendChild(dot);
+            b.onclick = function () {
+                size = s;
+                Array.prototype.forEach.call(document.querySelectorAll('.size'), function (x) { x.classList.remove('on'); });
+                b.classList.add('on');
+            };
+            tools.appendChild(b);
+        });
+        var clear = document.createElement('button');
+        clear.className = 'clear';
+        clear.textContent = 'Clear';
+        clear.onclick = function () {
+            clearLocal();
+            send({ k: 'clear' });
+        };
+        tools.appendChild(clear);
+    }
+
+    // ----- canvas -----
+    // Keep the board exactly 16:9 like the TV, as large as the screen allows.
+    function fitBoard() {
+        var main = document.querySelector('main');
+        var hint = $('hint');
+        var board = $('board');
+        var availW = main.clientWidth;
+        var availH = main.clientHeight - hint.offsetHeight - 12;
+        if (availW <= 0 || availH <= 0) {
+            return;
+        }
+        var w = Math.floor(Math.min(availW, availH * 16 / 9, 1100));
+        board.style.width = w + 'px';
+        board.style.height = Math.floor(w * 9 / 16) + 'px';
+    }
+
+    function fitCanvas() {
+        fitBoard();
+        var r = canvas.getBoundingClientRect();
+        var dpr = window.devicePixelRatio || 1;
+        var w = Math.round(r.width * dpr);
+        var h = Math.round(r.height * dpr);
+        if (canvas.width !== w || canvas.height !== h) {
+            var copy = document.createElement('canvas');
+            copy.width = canvas.width;
+            copy.height = canvas.height;
+            if (canvas.width && canvas.height) {
+                copy.getContext('2d').drawImage(canvas, 0, 0);
+            }
+            canvas.width = w;
+            canvas.height = h;
+            if (copy.width && copy.height) {
+                ctx.drawImage(copy, 0, 0, w, h);
+            }
+        }
+    }
+
+    function clearLocal() {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+    }
+
+    function point(e) {
+        var r = canvas.getBoundingClientRect();
+        var x = (e.clientX - r.left) / r.width;
+        var y = (e.clientY - r.top) / r.height;
+        x = Math.max(0, Math.min(1, x));
+        y = Math.max(0, Math.min(1, y));
+        return [Math.round(x * 10000) / 10000, Math.round(y * 10000) / 10000];
+    }
+
+    function drawLocal(from, to) {
+        ctx.strokeStyle = color;
+        ctx.fillStyle = color;
+        ctx.lineWidth = Math.max(2, size * canvas.width);
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        if (!from) {
+            ctx.beginPath();
+            ctx.arc(to[0] * canvas.width, to[1] * canvas.height, ctx.lineWidth / 2, 0, Math.PI * 2);
+            ctx.fill();
+            return;
+        }
+        ctx.beginPath();
+        ctx.moveTo(from[0] * canvas.width, from[1] * canvas.height);
+        ctx.lineTo(to[0] * canvas.width, to[1] * canvas.height);
+        ctx.stroke();
+    }
+
+    function flush() {
+        flushTimer = null;
+        if (!pending.length) {
+            return;
+        }
+        var pts = lastSent ? [lastSent].concat(pending) : pending.slice();
+        var flat = [];
+        for (var i = 0; i < pts.length; i++) {
+            flat.push(pts[i][0], pts[i][1]);
+        }
+        lastSent = pending[pending.length - 1];
+        pending = [];
+        send({ k: 'seg', c: color, w: size, p: flat });
+        sentSegments++;
+    }
+
+    function scheduleFlush() {
+        if (!flushTimer) {
+            flushTimer = setTimeout(flush, FLUSH_MS);
+        }
+    }
+
+    function onDown(e) {
+        e.preventDefault();
+        fitCanvas();
+        drawing = true;
+        try { canvas.setPointerCapture(e.pointerId); } catch (x) { /* ignore */ }
+        var p = point(e);
+        lastSent = null;
+        lastLocal = p;
+        pending = [p];
+        drawLocal(null, p);
+        scheduleFlush();
+    }
+
+    function onMove(e) {
+        if (!drawing) {
+            return;
+        }
+        e.preventDefault();
+        var p = point(e);
+        if (lastLocal && Math.abs(p[0] - lastLocal[0]) < 0.0015 && Math.abs(p[1] - lastLocal[1]) < 0.0015) {
+            return;
+        }
+        drawLocal(lastLocal, p);
+        lastLocal = p;
+        pending.push(p);
+        scheduleFlush();
+    }
+
+    function onUp(e) {
+        if (!drawing) {
+            return;
+        }
+        e.preventDefault();
+        drawing = false;
+        if (flushTimer) {
+            clearTimeout(flushTimer);
+        }
+        flush();
+        lastSent = null;
+        lastLocal = null;
+    }
+
+    // ----- relay -----
+    function send(obj) {
+        if (!client || !connected) {
+            return;
+        }
+        try {
+            var m = new Paho.Message(JSON.stringify(obj));
+            m.destinationName = topic('draw');
+            m.qos = 0;
+            client.send(m);
+        } catch (e) { /* dropped while reconnecting */ }
+    }
+
+    function showTvState() {
+        if (!connected) {
+            return;
+        }
+        if (tvOnline) {
+            setStatus('TV is ready', 'ok');
+        } else {
+            setStatus('Open "Draw from phone" on the TV', 'bad');
+        }
+    }
+
+    function connect() {
+        if (client) {
+            try { client.disconnect(); } catch (e) { /* ignore */ }
+        }
+        connected = false;
+        tvOnline = false;
+        setStatus('Connecting...');
+        var c = new Paho.Client(BROKER.host, Number(BROKER.port), BROKER.path, 'noortv-phone-' + code + '-' + Math.floor(Math.random() * 1e6));
+        client = c;
+        c.onConnectionLost = function () {
+            if (client !== c) { return; }
+            connected = false;
+            setStatus('Reconnecting...', 'bad');
+        };
+        c.onConnected = function (reconnect) {
+            if (client !== c || !reconnect) { return; }
+            connected = true;
+            c.subscribe(topic('tv'), { qos: 0 });
+            send({ k: 'hello' });
+            showTvState();
+        };
+        c.onMessageArrived = function (msg) {
+            if (client !== c) { return; }
+            var data;
+            try { data = JSON.parse(msg.payloadString); } catch (e) { return; }
+            if (data && data.k === 'tv') {
+                var was = tvOnline;
+                tvOnline = !!data.on;
+                if (tvOnline && !was) {
+                    send({ k: 'hello' });
+                }
+                showTvState();
+            }
+        };
+        c.connect({
+            useSSL: !!BROKER.ssl,
+            timeout: 10,
+            keepAliveInterval: 30,
+            cleanSession: true,
+            reconnect: true,
+            onSuccess: function () {
+                if (client !== c) { return; }
+                connected = true;
+                c.subscribe(topic('tv'), { qos: 0 });
+                send({ k: 'hello' });
+                showTvState();
+            },
+            onFailure: function () {
+                if (client !== c) { return; }
+                setStatus('Could not reach the drawing server', 'bad');
+            }
+        });
+    }
+
+    function join(c) {
+        c = (c || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+        if (!validCode(c)) {
+            $('err').textContent = 'The TV code has 6 letters and numbers.';
+            return false;
+        }
+        code = c;
+        if (location.hash !== '#' + c) {
+            history.replaceState(null, '', '#' + c);
+        }
+        document.body.classList.add('joined');
+        fitCanvas();
+        connect();
+        return true;
+    }
+
+    function init() {
+        buildTools();
+        canvas.addEventListener('pointerdown', onDown);
+        canvas.addEventListener('pointermove', onMove);
+        canvas.addEventListener('pointerup', onUp);
+        canvas.addEventListener('pointercancel', onUp);
+        window.addEventListener('resize', fitCanvas);
+        $('join-btn').onclick = function () { join($('code').value); };
+        $('code').addEventListener('keydown', function (e) {
+            if (e.key === 'Enter') { join($('code').value); }
+        });
+        $('change').onclick = function (e) {
+            e.preventDefault();
+            if (client) { try { client.disconnect(); } catch (x) { /* ignore */ } }
+            client = null;
+            document.body.classList.remove('joined');
+            history.replaceState(null, '', location.pathname);
+            setStatus('Not connected');
+        };
+        var fromHash = (location.hash || '').replace('#', '');
+        if (!fromHash || !join(fromHash)) {
+            setStatus('Not connected');
+            $('err').textContent = '';
+        }
+    }
+
+    window.noorPhone = { state: function () { return { code: code, connected: connected, tvOnline: tvOnline, sent: sentSegments }; } };
+    init();
+}());
+</script>
+</body>
+</html>
